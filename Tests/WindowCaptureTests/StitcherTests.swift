@@ -4,51 +4,80 @@ import ImageIO
 import Testing
 @testable import WindowCapture
 
-/// 数値の並びをそのまま行ハッシュにしたフレーム (0 は余白の行)
-private func frame(_ values: [Int]) -> Stitcher.FrameRows {
-    Stitcher.FrameRows(hashes: values.map { UInt64($0) }, isBlank: values.map { $0 == 0 })
+/// 数値の並びから作ったフレーム。数値ごとに別の模様の行になる (0 は 1 色の余白の行)
+private func frame(_ values: [Int]) -> Stitcher.FrameProfile {
+    let width = 16
+    let rows = values.flatMap { value -> [UInt8] in
+        value == 0
+            ? Array(repeating: 200, count: width)
+            : (0..<width).map { UInt8((value * 31 + $0 * 17 + ($0 % 3) * value) % 256) }
+    }
+    return Stitcher.FrameProfile(width: width, values: rows)
 }
 
-/// 長い文書 (行 y の値は 1000 + y) を、ヘッダー 2 行とフッター 1 行で挟んで offset から 40 行だけ見せたフレーム
-private func window(at offset: Int) -> Stitcher.FrameRows {
-    frame([9001, 9002] + (offset..<(offset + 40)).map { 1000 + $0 } + [9009])
+/// 長い文書 (行 y の値は 1000 + y) を、ヘッダー 2 行とフッター 1 行で挟んで offset から 60 行だけ見せたフレーム
+private func window(at offset: Int) -> Stitcher.FrameProfile {
+    frame([9001, 9002] + (offset..<(offset + 60)).map { 1000 + $0 } + [9009])
 }
 
 @Suite struct StitcherPlanTests {
     @Test func joinsScrolledFramesWithFixedHeaderAndFooter() {
-        let plan = Stitcher.plan([window(at: 0), window(at: 25), window(at: 50), window(at: 55)])
+        let plan = Stitcher.plan([window(at: 0), window(at: 30), window(at: 60), window(at: 66)])
+        // 重なりの真ん中でフレームを切り替える
         #expect(plan.segments == [
-            .init(frame: 0, rows: 0..<42),   // ヘッダー + 文書 0〜39
-            .init(frame: 1, rows: 17..<42),  // 文書 40〜64
-            .init(frame: 2, rows: 17..<42),  // 文書 65〜89
-            .init(frame: 3, rows: 37..<42),  // 文書 90〜94 (最後は少しだけ進んだ)
-            .init(frame: 3, rows: 42..<43),  // フッター
+            .init(frame: 0, rows: 0..<47),   // ヘッダー + 文書 0〜44
+            .init(frame: 1, rows: 17..<47),  // 文書 45〜74
+            .init(frame: 2, rows: 17..<35),  // 文書 75〜92
+            .init(frame: 3, rows: 29..<62),  // 文書 93〜125 (最後は少しだけ進んだ)
+            .init(frame: 3, rows: 62..<63),  // フッター
         ])
-        #expect(plan.height == 2 + 95 + 1)
+        #expect(plan.height == 2 + 126 + 1)
         #expect(plan.unmatchedCount == 0)
     }
 
     @Test func skipsIdenticalFrames() {
-        let plan = Stitcher.plan([window(at: 0), window(at: 25), window(at: 25)])
-        #expect(plan.height == 2 + 65 + 1)
+        let plan = Stitcher.plan([window(at: 0), window(at: 30), window(at: 30)])
+        #expect(plan.height == 2 + 90 + 1)
     }
 
     @Test func appendsWholeContentWhenNoOverlap() {
-        let plan = Stitcher.plan([window(at: 0), window(at: 100)])
+        let plan = Stitcher.plan([window(at: 0), window(at: 200)])
         #expect(plan.unmatchedCount == 1)
-        #expect(plan.height == 2 + 80 + 1)
+        #expect(plan.height == 2 + 120 + 1)
     }
 
     @Test func blankRowsDoNotDecideShift() {
         // 余白の行 (0) が多くても、内容の行で正しいずれを求める
-        let a = frame([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])
-        let b = frame([0, 0, 0, 0, 0, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25])
-        #expect(Stitcher.offset(a, b, region: 0..<20) == 5)
+        let a = frame(Array(repeating: 0, count: 20) + Array(11...40))
+        let b = frame(Array(repeating: 0, count: 15) + Array(11...45))
+        #expect(Stitcher.offset(a, b, region: 0..<50) == 5)
+    }
+
+    @Test func toleratesSlightDifferencesBetweenFrames() {
+        // 文字のにじみ方が少し違う (各値が ±3 ずれる) フレームでもつなげる
+        var b = window(at: 30)
+        b.values = b.values.enumerated().map { index, value in UInt8(clamping: Int(value) + (index % 7 - 3)) }
+        #expect(Stitcher.offset(window(at: 0), b, region: 2..<62) == 30)
+    }
+
+    @Test func ignoresPartlyChangingRows() {
+        // 広告などで一部の行が変わっていても、残りが合えばつなげる
+        var b = window(at: 30)
+        for y in 10..<14 {
+            for x in 0..<b.width { b.values[y * b.width + x] = UInt8((x * 97 + y * 13) % 256) }
+        }
+        #expect(Stitcher.offset(window(at: 0), b, region: 2..<62) == 30)
+    }
+
+    @Test func prefersExpectedShiftWhenAmbiguous() {
+        // 同じ模様が 10 行おきに繰り返すと、ずれは 10 の倍数のどれでも合う
+        let rows = frame((0..<60).map { 1 + $0 % 10 })
+        #expect(Stitcher.offset(rows, rows, region: 0..<60, expectedShift: 30) == 30)
     }
 
     @Test func singleFrameIsKeptAsIs() {
         let plan = Stitcher.plan([window(at: 0)])
-        #expect(plan.segments == [.init(frame: 0, rows: 0..<43)])
+        #expect(plan.segments == [.init(frame: 0, rows: 0..<63)])
     }
 }
 
@@ -135,15 +164,29 @@ private enum FakeDocument {
         return try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
     }
 
-    /// (スクロールバーの列を除いて) すべての行が同じか
+    /// (スクロールバーの列を除いて) すべての行のピクセルが同じか
     private func expectSameRows(_ actual: CGImage, _ expected: CGImage, ignoringScrollbar: Bool = true) throws {
         #expect(actual.width == expected.width)
         #expect(actual.height == expected.height)
-        guard actual.height == expected.height else { return }
-        let ignored = ignoringScrollbar ? FakeDocument.scrollbar : 0
-        let a = Stitcher.rows(of: actual, ignoringTrailingColumns: ignored)
-        let b = Stitcher.rows(of: expected, ignoringTrailingColumns: ignored)
-        let mismatched = zip(a.hashes, b.hashes).enumerated().filter { $0.element.0 != $0.element.1 }.map(\.offset)
+        guard actual.width == expected.width, actual.height == expected.height else { return }
+        let a = pixels(actual), b = pixels(expected)
+        let usedBytes = (actual.width - (ignoringScrollbar ? FakeDocument.scrollbar : 0)) * 4
+        let bytesPerRow = actual.width * 4
+        let mismatched = (0..<actual.height).filter { y in
+            a[(y * bytesPerRow)..<(y * bytesPerRow + usedBytes)] != b[(y * bytesPerRow)..<(y * bytesPerRow + usedBytes)]
+        }
         #expect(mismatched.isEmpty, "一致しない行: \(mismatched.prefix(10))")
+    }
+
+    private func pixels(_ image: CGImage) -> [UInt8] {
+        var data = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        data.withUnsafeMutableBytes { buffer in
+            CGContext(
+                data: buffer.baseAddress, width: image.width, height: image.height, bitsPerComponent: 8,
+                bytesPerRow: image.width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )?.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        }
+        return data
     }
 }

@@ -5,6 +5,12 @@ struct DetailView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
+        content
+            .toolbar { SelectionToolbar() }
+    }
+
+    @ViewBuilder
+    private var content: some View {
         if let window = model.selectedWindow {
             VSplitView {
                 PreviewPane(window: window)
@@ -23,6 +29,35 @@ struct DetailView: View {
             } actions: {
                 Button("クリックで選択") { Task { await model.pickWindowByClick() } }
                     .disabled(!model.hasScreenRecording)
+            }
+        }
+    }
+}
+
+/// 対象ウィンドウを選び直す・選択を外すボタン
+private struct SelectionToolbar: ToolbarContent {
+    @Environment(AppModel.self) private var model
+
+    var body: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button {
+                Task { await model.pickWindowByClick() }
+            } label: {
+                Label(model.selectedWindow == nil ? "クリックで選択" : "クリックで選び直す", systemImage: "cursorarrow.rays")
+                    .labelStyle(.titleAndIcon)
+            }
+            .help("画面上のウィンドウをクリックして選択します (Esc でキャンセル)")
+            .disabled(!model.hasScreenRecording || model.session.isRunning)
+
+            if model.selectedWindow != nil {
+                Button {
+                    model.clearSelection()
+                } label: {
+                    Label("選択解除", systemImage: "xmark.circle")
+                        .labelStyle(.titleAndIcon)
+                }
+                .help("選択を外して、ウィンドウを選ぶ前の画面に戻します")
+                .disabled(model.session.isRunning)
             }
         }
     }

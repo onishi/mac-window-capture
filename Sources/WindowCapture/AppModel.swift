@@ -7,8 +7,16 @@ struct StatusMessage: Equatable {
 
     var text: String
     var kind: Kind = .info
-    /// 「Finder で表示」で開く場所
-    var url: URL?
+    /// 「ファイルを開く」「フォルダを開く」の対象
+    var output: CaptureOutput?
+}
+
+/// 撮影結果の場所
+struct CaptureOutput: Equatable {
+    /// 「ファイルを開く」で開くファイル (つなげた PNG、PDF、または撮った PNG 全部)
+    var files: [URL]
+    /// 保存したフォルダ
+    var folder: URL
 }
 
 @Observable
@@ -114,6 +122,13 @@ final class AppModel {
         }
     }
 
+    /// 選択を外して、ウィンドウを選ぶ前の状態に戻す
+    func clearSelection() {
+        guard !session.isRunning else { return }
+        selectedWindowID = nil
+        status = nil
+    }
+
     func refreshPreview() async {
         guard let window = selectedWindow else {
             preview = nil
@@ -164,7 +179,7 @@ final class AppModel {
             }
             status = StatusMessage(
                 text: "保存しました\(copyToClipboard ? "（クリップボードにもコピー）" : ""): \(url.lastPathComponent)",
-                kind: .success, url: url
+                kind: .success, output: CaptureOutput(files: [url], folder: saveDirectory)
             )
         } catch {
             status = StatusMessage(text: "キャプチャに失敗しました: \(error.localizedDescription)", kind: .error)
@@ -203,8 +218,21 @@ final class AppModel {
         NSWorkspace.shared.open(saveDirectory)
     }
 
-    func reveal(_ url: URL) {
-        NSWorkspace.shared.activateFileViewerSelecting([url])
+    /// 結果のファイルを既定のアプリで開く。PNG が複数あれば 1 つのウィンドウにまとめて開く
+    func open(_ output: CaptureOutput) {
+        guard let first = output.files.first,
+              let app = NSWorkspace.shared.urlForApplication(toOpen: first)
+        else { return }
+        NSWorkspace.shared.open(output.files, withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
+    }
+
+    /// 結果を Finder で表示する。ファイルが 1 つならそれを選んだ状態で、複数ならフォルダを開く
+    func revealFolder(_ output: CaptureOutput) {
+        if output.files.count == 1 {
+            NSWorkspace.shared.activateFileViewerSelecting(output.files)
+        } else {
+            NSWorkspace.shared.open(output.folder)
+        }
     }
 
     // MARK: - 起動オプション

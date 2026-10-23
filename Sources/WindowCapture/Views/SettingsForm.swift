@@ -114,7 +114,7 @@ private struct OutputSection: View {
             }
             .pickerStyle(.segmented)
             if model.settings.effectiveOutput == .stitched {
-                Text("スクロールして撮った画像の重なりを取り除き、縦長 (左右のスクロールなら横長) の PNG 1 枚にします。ツールバーなどの固定部分は 1 回だけ入ります。")
+                Text("スクロールして撮った画像の重なりを取り除き、縦長 (左右のスクロールなら横長) の PNG 1 枚にします。ツールバーなどの固定部分は 1 回だけ入ります。つなぎ目を探すため、スクロール量は最大 \(Int(LoopSettings.maxStitchScrollRatio * 100))% にします。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

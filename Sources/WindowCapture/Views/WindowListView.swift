@@ -28,15 +28,6 @@ struct WindowListView: View {
         .toolbar {
             ToolbarItem {
                 Button {
-                    Task { await model.pickWindowByClick() }
-                } label: {
-                    Label("クリックで選択", systemImage: "cursorarrow.rays")
-                }
-                .help("画面上のウィンドウをクリックして選択")
-                .disabled(!model.hasScreenRecording || model.session.isRunning)
-            }
-            ToolbarItem {
-                Button {
                     Task { await model.refreshWindows() }
                 } label: {
                     Label("一覧を更新", systemImage: "arrow.clockwise")

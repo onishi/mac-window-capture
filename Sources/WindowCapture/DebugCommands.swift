@@ -1,17 +1,58 @@
 import AppKit
+import ImageIO
 
 /// 調査用の隠しコマンド。アプリ本体の権限で動かすため LaunchServices 経由で起動する:
 ///   open -n ~/Applications/WindowCapture.app --args --dump-ax <アプリ名> <出力ファイル>
 ///   open -n ~/Applications/WindowCapture.app --args --detect-content <アプリ名> <出力ファイル>
+///   WindowCapture --stitch-files <出力PNG> <scale> <想定スクロール量pt または -> <画像...>   (権限不要なので直接実行してよい)
 enum DebugCommands {
     static func runIfRequested() {
         let args = CommandLine.arguments
+        if let index = args.firstIndex(of: "--stitch-files"), args.count > index + 4 {
+            stitchFiles(Array(args[(index + 1)...]))
+        }
         for (flag, command) in [("--dump-ax", dumpAccessibilityTree), ("--detect-content", detectContent)] {
             guard let index = args.firstIndex(of: flag), args.count > index + 2 else { continue }
             let output = command(args[index + 1])
             try? output.write(toFile: args[index + 2], atomically: true, encoding: .utf8)
             exit(0)
         }
+    }
+
+    /// 画像ファイルを 1 枚につなげ、結果の大きさとつなぎ目不明の数を表示して終了する
+    private static func stitchFiles(_ args: [String]) -> Never {
+        let output = URL(filePath: args[0])
+        let scale = CGFloat(Double(args[1]) ?? 1)
+        let expected = Double(args[2])
+        let pages = args[3...].map { URL(filePath: $0) }
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            do {
+                let start = Date()
+                let result = try await Stitcher.stitch(
+                    pages: pages, direction: .down, scale: scale, expectedShiftPoints: expected, to: output
+                )
+                print("size \(Int(result.pixelSize.width))x\(Int(result.pixelSize.height)) unmatched \(result.unmatchedCount) time \(String(format: "%.2f", Date().timeIntervalSince(start)))s")
+                // ペアごとの固定部分とずれ
+                let profiles = try pages.map { page -> Stitcher.FrameProfile in
+                    guard let source = CGImageSourceCreateWithURL(page as CFURL, nil),
+                          let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+                    else { throw ExportError.cannotRead(page) }
+                    return Stitcher.profile(of: image, ignoringSideColumns: Int(Stitcher.ignoredSidePoints * scale))
+                }
+                for index in 1..<profiles.count {
+                    let edges = Stitcher.fixedEdges(profiles[index - 1], profiles[index])
+                    let region = (edges?.top ?? 0)..<(profiles[index].height - (edges?.bottom ?? 0))
+                    let shift = Stitcher.offset(profiles[index - 1], profiles[index], region: region)
+                    print("pair \(index - 1)->\(index): fixed \(edges.map { "\($0.top)/\($0.bottom)" } ?? "same") content \(region.count) shift \(shift.map(String.init) ?? "nil")")
+                }
+            } catch {
+                print("error: \(error)")
+            }
+            done.signal()
+        }
+        done.wait()
+        exit(0)
     }
 
     /// 指定アプリの各ウィンドウについて、中身として検出した矩形 (ウィンドウ左上原点) を書き出す。

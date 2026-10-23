@@ -68,8 +68,8 @@ private struct StatusView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(status.text)
-                if let url = status.url {
-                    revealButton(url)
+                if let output = status.output {
+                    outputButtons(output)
                 }
             } else {
                 switch session.phase {
@@ -81,14 +81,14 @@ private struct StatusView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .help(reason)
-                    if let url = session.outputURL { revealButton(url) }
+                    if let output = session.output { outputButtons(output) }
                 case .failed(let message):
                     icon(for: .error)
                     Text(message)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .help(message)
-                    if let url = session.outputURL { revealButton(url) }
+                    if let output = session.output { outputButtons(output) }
                 }
             }
         }
@@ -115,13 +115,29 @@ private struct StatusView: View {
         }
     }
 
-    private func revealButton(_ url: URL) -> some View {
-        Button {
-            model.reveal(url)
-        } label: {
-            Image(systemName: "folder")
+    /// 撮影後すぐに結果を見られるよう、文字付きのボタンで目立たせる
+    private func outputButtons(_ output: CaptureOutput) -> some View {
+        HStack(spacing: 8) {
+            Button {
+                model.open(output)
+            } label: {
+                Label(output.files.count > 1 ? "ファイルを開く (\(output.files.count))" : "ファイルを開く", systemImage: "doc.richtext")
+            }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut("o", modifiers: .command)
+            .help("撮った結果を開く (⌘O)")
+
+            Button {
+                model.revealFolder(output)
+            } label: {
+                Label("フォルダを開く", systemImage: "folder")
+            }
+            .buttonStyle(.bordered)
+            .keyboardShortcut("o", modifiers: [.command, .shift])
+            .help("Finder で表示 (⌘⇧O)")
         }
-        .buttonStyle(.borderless)
-        .help("Finder で表示")
+        .controlSize(.regular)
+        .fixedSize()
+        .padding(.leading, 6)
     }
 }

@@ -80,7 +80,7 @@ enum KeyPreset: String, CaseIterable, Identifiable, Codable {
 }
 
 enum OutputFormat: String, CaseIterable, Identifiable, Codable {
-    case png, pdf, pngAndPDF, stitched
+    case png, stitched, pngAndPDF, pdf
 
     var id: Self { self }
 
@@ -129,6 +129,14 @@ struct LoopSettings: Codable, Equatable {
     static let safetyLimit = 10_000
     static let intervalRange: ClosedRange<Double> = 0.1...30
     static let timerIntervalRange: ClosedRange<Double> = 0.1...3600
+
+    /// 1 枚につなげるときのスクロール量の上限。つなぎ目を探すため、前の画像と 30% 以上重なるようにする
+    static let maxStitchScrollRatio = 0.7
+
+    /// 実際に使うスクロール量の割合
+    var effectiveScrollRatio: Double {
+        effectiveOutput == .stitched ? min(scrollRatio, Self.maxStitchScrollRatio) : scrollRatio
+    }
 
     /// 実際に使う出力形式 (撮り方で選べない形式が残っていたら PNG にする)
     var effectiveOutput: OutputFormat {

@@ -26,8 +26,8 @@ final class CaptureSession {
     private(set) var capturedCount = 0
     /// 一定間隔モードで、変化がなく保存しなかった回数
     private(set) var skippedCount = 0
-    /// 結果の場所 (PNG を残すならフォルダ、PDF のみなら PDF ファイル)
-    private(set) var outputURL: URL?
+    /// 撮影結果の場所 (撮れなかったときは nil)
+    private(set) var output: CaptureOutput?
     private(set) var lastFrame: CGImage?
 
     /// 撮影後に PDF を作ったり 1 枚につなげたりしている間の進み具合 (していないときは nil)
@@ -53,7 +53,7 @@ final class CaptureSession {
         skippedCount = 0
         stopReason = nil
         stitchNote = nil
-        outputURL = nil
+        output = nil
         lastFrame = nil
         // 一定間隔モードは他のアプリを使いながら撮るので、他のアプリでの Esc では止めない
         installEscapeMonitors(global: settings.action.needsFocus)
@@ -73,7 +73,7 @@ final class CaptureSession {
     // MARK: - Private
 
     private func run(window: WindowInfo, settings: LoopSettings, includeShadow: Bool, crop: CropInsets?, saveRoot: URL) async {
-        let driver = InputDriver(window: window)
+        var driver = InputDriver(window: window, crop: crop)
         let originalCursor = InputDriver.cursorLocation
         defer {
             if settings.action.usesPoint { InputDriver.restoreCursor(to: originalCursor) }
@@ -117,7 +117,7 @@ final class CaptureSession {
                 try await runTimer(window: window, settings: settings, includeShadow: includeShadow, crop: crop, save: save)
             } else {
                 reason = try await runActions(
-                    window: window, driver: driver, settings: settings, includeShadow: includeShadow, crop: crop, save: save
+                    window: window, driver: &driver, settings: settings, includeShadow: includeShadow, crop: crop, save: save
                 ) ?? reason
             }
         } catch is CancellationError {
@@ -129,8 +129,9 @@ final class CaptureSession {
 
         let summary = "\(pages.count) 枚撮影" + (skippedCount > 0 ? " · 変化なし \(skippedCount) 回" : "")
         do {
-            outputURL = try await finalize(
-                pages: pages, scale: scale, settings: settings, directory: directory, saveRoot: saveRoot, name: name
+            output = try await finalize(
+                pages: pages, scale: scale, settings: settings, directory: directory, saveRoot: saveRoot, name: name,
+                expectedScrollPoints: settings.action == .scroll ? driver.scrollDistance(settings) : nil
             )
             let note = stitchNote.map { " · \($0)" } ?? ""
             phase = failure.map { .failed(message: "\($0) · \(summary)\(note)") }
@@ -142,14 +143,19 @@ final class CaptureSession {
 
     /// 操作モード。画面が変化しなくなって止めたときはその理由を返す。
     private func runActions(
-        window: WindowInfo, driver: InputDriver, settings: LoopSettings,
+        window: WindowInfo, driver: inout InputDriver, settings: LoopSettings,
         includeShadow: Bool, crop: CropInsets?, save: (CapturedFrame) throws -> Void
     ) async throws -> String? {
         driver.bringToFront()
+        if settings.action.usesPoint {
+            try await driver.parkCursor()
+        }
         // 前面に出した直後に出る入力モードの表示などが消えるまで待つ
         try await Task.sleep(for: .seconds(1))
         var previous = try await WindowCapturer.captureStable(window.scWindow, includeShadow: includeShadow, crop: crop)
         try save(previous)
+        // つなげるときは、固定ヘッダーなどの高さを測ってスクロール量を合わせる
+        let measuresFixedEdges = settings.effectiveOutput == .stitched && settings.action == .scroll
 
         while capturedCount < settings.effectiveMaxCount {
             if !driver.isFrontmost {
@@ -163,9 +169,26 @@ final class CaptureSession {
                 return "画面が変化しなくなりました"
             }
             try save(frame)
+            if measuresFixedEdges {
+                adjustScrollLength(&driver, previous: previous, current: frame, settings: settings)
+            }
             previous = frame
         }
         return nil
+    }
+
+    /// 2 枚から固定部分 (固定ヘッダーなど) の高さを測り、スクロールで動く部分の長さに合わせてスクロール量を決め直す。
+    /// 固定ヘッダーが大きいと、撮る範囲を基準にしたスクロール量では見えている内容より先へ進んでしまい、重なりがなくなるため
+    private func adjustScrollLength(
+        _ driver: inout InputDriver, previous: CapturedFrame, current: CapturedFrame, settings: LoopSettings
+    ) {
+        let side = Int(Stitcher.ignoredSidePoints * current.scale)
+        let rotation: Stitcher.Rotation = settings.scrollDirection.isVertical ? .none : .clockwise
+        let a = Stitcher.profile(of: Stitcher.rotate(previous.image, rotation), ignoringSideColumns: side)
+        let b = Stitcher.profile(of: Stitcher.rotate(current.image, rotation), ignoringSideColumns: side)
+        guard let edges = Stitcher.fixedEdges(a, b) else { return }
+        let scrollablePixels = b.height - edges.top - edges.bottom
+        driver.scrollableLength = CGFloat(scrollablePixels) / current.scale
     }
 
     /// 一定間隔モード。開始時刻を基準に撮るので、キャプチャに時間がかかっても間隔がずれていかない。
@@ -193,32 +216,33 @@ final class CaptureSession {
         }
     }
 
-    /// PDF を作り、Finder で示す場所を返す (PNG を残すならフォルダ、PDF のみなら PDF ファイル)。
+    /// PDF を作ったり 1 枚につなげたりして、結果の場所を返す。
     /// 撮影を止めたあとの PDF 作成やつなぎ合わせは、停止ボタンでは中断しない (撮れた分を必ず書き出す)。
-    /// Finder で示す場所 (PNG を残すならフォルダ、それ以外は作ったファイル) を返す。
     private func finalize(
-        pages: [URL], scale: CGFloat, settings: LoopSettings, directory: URL, saveRoot: URL, name: String
-    ) async throws -> URL? {
+        pages: [URL], scale: CGFloat, settings: LoopSettings, directory: URL, saveRoot: URL, name: String,
+        expectedScrollPoints: CGFloat?
+    ) async throws -> CaptureOutput? {
         let format = settings.effectiveOutput
-        guard !pages.isEmpty else { return format.keepsPNG ? directory : nil }
+        guard !pages.isEmpty else { return nil }
         let total = pages.count
         defer { finalizingText = nil }
 
         if format == .stitched {
             let url = try Exporter.makeDirectory(saveRoot).appending(path: "\(name).png")
             finalizingText = "1 枚につなげています 0/\(total)"
+            let expectedShift = expectedScrollPoints.map(Double.init)
             let result = try await Stitcher.stitch(
-                pages: pages, direction: settings.stitchDirection, scale: scale, to: url
+                pages: pages, direction: settings.stitchDirection, scale: scale, expectedShiftPoints: expectedShift, to: url
             ) { [weak self] done in
                 Task { @MainActor in
                     if self?.finalizingText != nil { self?.finalizingText = "1 枚につなげています \(done)/\(total)" }
                 }
             }
             stitchNote = result.unmatchedCount > 0 ? "つなぎ目不明 \(result.unmatchedCount) か所" : nil
-            return url
+            return CaptureOutput(files: [url], folder: saveRoot)
         }
 
-        guard format.makesPDF else { return directory }
+        guard format.makesPDF else { return CaptureOutput(files: pages, folder: directory) }
         let pdfURL = format.keepsPNG
             ? directory.appending(path: "\(name).pdf")
             : try Exporter.makeDirectory(saveRoot).appending(path: "\(name).pdf")
@@ -232,7 +256,7 @@ final class CaptureSession {
                 if self?.finalizingText != nil { self?.finalizingText = describe(done) }
             }
         }
-        return format.keepsPNG ? directory : pdfURL
+        return CaptureOutput(files: [pdfURL], folder: format.keepsPNG ? directory : saveRoot)
     }
 
     /// 停止のきっかけを監視する。

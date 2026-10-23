@@ -4,17 +4,59 @@ import ImageIO
 
 /// スクロールしながら撮った画像を、重なりを除いて 1 枚につなげる。
 ///
-/// 1. 各行のピクセルからハッシュを作る (スクロール中に出るスクロールバーで一致しなくならないよう、その列は除く)
-/// 2. 隣り合う 2 枚で、同じ位置に同じ行が続く上端・下端を「固定部分」(タイトルバー・ツールバー・固定ヘッダーなど) とみなす
-/// 3. 固定部分を除いた範囲で、同じ行がどれだけずれて現れるかを多数決で求め、それをスクロール量とする
-/// 4. 1 枚目の上端からの内容に、各フレームで新しく現れた行を足し、最後に下端の固定部分を付ける
+/// アプリによっては (Chrome など)、スクロール位置が 1 ピクセル未満ずれて文字のにじみ方が変わるため、
+/// 同じ内容でもピクセル単位では一致しない。そのため行をそのまま比べず、各行を横方向に縮めた明るさの並び
+/// (プロファイル) を作り、差が最も小さくなるずれを探す。
+///
+/// 1. 各行のプロファイルを作る (スクロールバーや角丸の出る左右の端は除く)
+/// 2. 隣り合う 2 枚で、同じ位置にほぼ同じ行が続く上端・下端を「固定部分」(タイトルバー・ツールバーなど) とみなす。
+///    固定ヘッダーも描き直されるたびに少し違うことがあるので、行の 9 割がほぼ同じなら同じ行とする
+/// 3. 固定部分を除いた範囲で、b の行 y と a の行 y + shift の差が最も小さい shift をスクロール量とする。
+///    - 右側の広告だけ止まっているような、一部の列だけ動かないページがあるので、動いている列だけで比べる
+///    - 広告やアニメーションで一部の行が変わっても引きずられないよう、行ごとの差には上限を設けて平均する
+/// 4. 1 枚目の内容に、各フレームで新しく現れた行を足し、最後に下端の固定部分を付ける。
+///    前のフレームから次のフレームへは重なりの真ん中で切り替える (フレームの端に出るウィンドウの角丸や、
+///    ブラウザの左下のリンク表示などがつなぎ目に入らないように)
 nonisolated enum Stitcher {
-    /// 1 枚分の行ハッシュ
-    struct FrameRows: Sendable {
-        var hashes: [UInt64]
-        /// 1 色だけの行 (余白など)。どこにでも一致してしまうので、ずれの多数決には使わない
-        var isBlank: [Bool]
-        var height: Int { hashes.count }
+    /// 1 枚分の行プロファイル。行 y の明るさの並びは values[y * width ..< (y + 1) * width]
+    struct FrameProfile: Sendable {
+        var width: Int
+        var values: [UInt8]
+
+        var height: Int { width == 0 ? 0 : values.count / width }
+
+        func value(row y: Int, column x: Int) -> Int { Int(values[y * width + x]) }
+
+        /// 2 行の明るさの差の平均 (0...255)。columns を指定するとその列だけで比べる
+        func difference(row y: Int, to other: FrameProfile, row otherY: Int, columns: [Int]? = nil) -> Double {
+            var total = 0
+            if let columns {
+                for x in columns { total += abs(value(row: y, column: x) - other.value(row: otherY, column: x)) }
+                return Double(total) / Double(max(1, columns.count))
+            }
+            for x in 0..<width { total += abs(value(row: y, column: x) - other.value(row: otherY, column: x)) }
+            return Double(total) / Double(width)
+        }
+
+        /// 2 行で、明るさがほぼ同じ列の割合 (0...1)
+        func similarity(row y: Int, to other: FrameProfile, row otherY: Int) -> Double {
+            var same = 0
+            for x in 0..<width where abs(value(row: y, column: x) - other.value(row: otherY, column: x)) <= 12 {
+                same += 1
+            }
+            return Double(same) / Double(width)
+        }
+
+        /// 内容のある行か (余白のような 1 色の行はどのずれにも合ってしまうので、判定に使えない)
+        func isTextured(row y: Int, columns: [Int]) -> Bool {
+            var low = 255, high = 0
+            for x in columns {
+                let v = value(row: y, column: x)
+                low = min(low, v)
+                high = max(high, v)
+            }
+            return high - low > 24
+        }
     }
 
     /// 出力画像を組み立てる部品。frame 番目の画像の rows の行を、上から順に並べる
@@ -36,28 +78,42 @@ nonisolated enum Stitcher {
         var unmatchedCount: Int
     }
 
-    /// 重なりとして認める、一致した行の最低割合
-    static let minimumMatchRatio = 0.8
-    /// 重なりとして認める最低行数
-    static let minimumOverlapRows = 8
-    /// 行ハッシュから除く右端の幅 (ポイント)。オーバーレイ表示のスクロールバーの分
-    static let ignoredTrailingPoints = 20.0
+    /// 行プロファイルの横の要素数
+    static let profileWidth = 160
+    /// 同じ行とみなす、ほぼ同じ列の割合の下限 (固定部分の判定用)
+    static let sameRowSimilarity = 0.9
+    /// 固定部分の判定で、これだけ違う行が続いたら固定部分の終わりとする (1〜2 行のちらつきは許す)
+    static let fixedEdgeBreakRows = 3
+    /// 固定部分 (上端 + 下端) が占めてよい高さの割合の上限
+    static let maxFixedRatio = 0.45
+    /// 2 枚で動いていないとみなす列の、差の平均の上限
+    static let staticColumnThreshold = 2.5
+    /// 重なりとして認める、行の差の平均の上限
+    static let matchThreshold = 6.0
+    /// 平均するときの、行ごとの差の上限 (一部の行だけ大きく違っても引きずられないように)
+    static let rowDifferenceCap = 40.0
+    /// 重なりとして認める最低行数と、そのうち内容のある行の最低数
+    static let minimumOverlapRows = 16
+    static let minimumTexturedRows = 6
+    /// 行プロファイルから除く左右の幅 (ポイント)。スクロールバーやウィンドウの角丸の分
+    static let ignoredSidePoints = 20.0
 
-    // MARK: - 組み立て計画 (ピクセルに触れない純粋な計算)
+    // MARK: - 組み立て計画 (ピクセルに触れない計算)
 
-    static func plan(_ frames: [FrameRows]) -> Plan {
+    /// expectedShift は 1 回のスクロールで進むはずの行数。判断がつかないときの手がかりにする
+    static func plan(_ frames: [FrameProfile], expectedShift: Int? = nil) -> Plan {
         guard let first = frames.first else { return Plan(segments: [], unmatchedCount: 0) }
         let height = first.height
-        guard frames.count > 1, frames.allSatisfy({ $0.height == height }) else {
+        guard frames.count > 1, frames.allSatisfy({ $0.height == height && $0.width == first.width }) else {
             return Plan(segments: [Segment(frame: 0, rows: 0..<height)], unmatchedCount: 0)
         }
 
         // 固定部分は全ペアで共通に使う (ペアごとに違うと、つなぎ目で行がずれるため)。
+        // うまく判定できないペアに引きずられないよう中央値を使う。
         // 内容がまったく同じペア (最後まで進んで動かなくなった等) は判定に使わない
-        let pairs = (1..<frames.count).map { (frames[$0 - 1], frames[$0]) }
-        let edges = pairs.compactMap { fixedEdges($0.0, $0.1) }
-        let top = edges.map(\.top).min() ?? 0
-        let bottom = edges.map(\.bottom).min() ?? 0
+        let edges = (1..<frames.count).compactMap { fixedEdges(frames[$0 - 1], frames[$0]) }
+        let top = median(edges.map(\.top))
+        let bottom = median(edges.map(\.bottom))
         let contentEnd = height - bottom
 
         var segments = [Segment(frame: 0, rows: 0..<contentEnd)]
@@ -66,15 +122,19 @@ nonisolated enum Stitcher {
             let previous = frames[index - 1], current = frames[index]
             guard fixedEdges(previous, current) != nil else { continue }  // 同じ画面
             let shift: Int
-            if let found = offset(previous, current, region: top..<contentEnd) {
+            if let found = offset(previous, current, region: top..<contentEnd, expectedShift: expectedShift) {
                 shift = found
             } else {
                 shift = contentEnd - top
                 unmatched += 1
             }
-            if shift > 0 {
-                segments.append(Segment(frame: index, rows: (contentEnd - shift)..<contentEnd))
-            }
+            guard shift > 0 else { continue }
+            // 重なりの半分だけ前のフレームを短くし、そのぶん次のフレームを上から使う
+            let overlap = contentEnd - top - shift
+            let last = segments[segments.count - 1]
+            let trim = min(overlap / 2, max(0, last.rows.count - 1))
+            segments[segments.count - 1].rows = last.rows.lowerBound..<(last.rows.upperBound - trim)
+            segments.append(Segment(frame: index, rows: (contentEnd - shift - trim)..<contentEnd))
         }
         if bottom > 0 {
             segments.append(Segment(frame: frames.count - 1, rows: contentEnd..<height))
@@ -82,53 +142,98 @@ nonisolated enum Stitcher {
         return Plan(segments: segments, unmatchedCount: unmatched)
     }
 
-    /// 2 枚で、同じ位置に同じ行が続く上端と下端の行数。2 枚がまったく同じなら nil。
-    static func fixedEdges(_ a: FrameRows, _ b: FrameRows) -> (top: Int, bottom: Int)? {
+    /// 2 枚で、同じ位置にほぼ同じ行が続く上端と下端の行数。2 枚がほぼ同じなら nil。
+    static func fixedEdges(_ a: FrameProfile, _ b: FrameProfile) -> (top: Int, bottom: Int)? {
         let height = min(a.height, b.height)
-        var top = 0
-        while top < height && a.hashes[top] == b.hashes[top] { top += 1 }
-        guard top < height else { return nil }
-        var bottom = 0
-        while bottom < height - top && a.hashes[height - 1 - bottom] == b.hashes[height - 1 - bottom] { bottom += 1 }
+        let same = (0..<height).map { a.similarity(row: $0, to: b, row: $0) >= sameRowSimilarity }
+        guard same.contains(false) else { return nil }
+
+        /// rows の順にたどり、違う行が fixedEdgeBreakRows 行続く手前までを固定部分とする
+        func fixedLength(_ rows: some Sequence<Int>) -> Int {
+            var length = 0, position = 0, misses = 0
+            for y in rows {
+                position += 1
+                if same[y] {
+                    length = position
+                    misses = 0
+                } else {
+                    misses += 1
+                    if misses >= fixedEdgeBreakRows { break }
+                }
+            }
+            return length
+        }
+        let limit = Int(Double(height) * maxFixedRatio)
+        let top = min(fixedLength(0..<height), limit)
+        let bottom = min(fixedLength((top..<height).reversed()), limit - top)
         return (top, bottom)
     }
 
-    /// region の範囲で、b の行 y が a の行 y + shift に一致するような shift (b が下にスクロールした量)。
-    /// 見つからなければ nil。
-    static func offset(_ a: FrameRows, _ b: FrameRows, region: Range<Int>) -> Int? {
-        guard region.count > minimumOverlapRows else { return nil }
+    private static func median(_ values: [Int]) -> Int {
+        guard !values.isEmpty else { return 0 }
+        return values.sorted()[values.count / 2]
+    }
 
-        // a の行ハッシュ → 位置。何度も出てくる行 (罫線など) は多数決を乱すので使わない
-        var positions: [UInt64: [Int]] = [:]
-        for y in region where !a.isBlank[y] {
-            positions[a.hashes[y], default: []].append(y)
+    /// region の範囲で、b の行 y が a の行 y + shift に最もよく合う shift (b が下にスクロールした行数)。
+    /// 合うものが無ければ nil。
+    static func offset(_ a: FrameProfile, _ b: FrameProfile, region: Range<Int>, expectedShift: Int? = nil) -> Int? {
+        let maxShift = region.count - minimumOverlapRows
+        guard maxShift >= 1 else { return nil }
+
+        // 動いている列 (同じ位置で比べて違う列) だけで比べる。ほとんど動いていなければ全列を使う
+        let moving = (0..<a.width).filter { x in
+            var total = 0
+            for y in region { total += abs(a.value(row: y, column: x) - b.value(row: y, column: x)) }
+            return Double(total) / Double(region.count) >= staticColumnThreshold
         }
-        var votes: [Int: Int] = [:]
-        for y in region where !b.isBlank[y] {
-            guard let matches = positions[b.hashes[y]], matches.count <= 4 else { continue }
-            for match in matches where match > y {
-                votes[match - y, default: 0] += 1
+        let columns = moving.count >= a.width / 10 ? moving : Array(0..<a.width)
+
+        // 内容のある行だけで比べる
+        let textured = region.filter { b.isTextured(row: $0, columns: columns) }
+        func score(_ shift: Int, stride step: Int) -> Double? {
+            var total = 0.0, count = 0, index = 0
+            for y in textured where y + shift < region.upperBound {
+                if index % step == 0 {
+                    total += min(a.difference(row: y + shift, to: b, row: y, columns: columns), rowDifferenceCap)
+                    count += 1
+                }
+                index += 1
+            }
+            guard index >= minimumTexturedRows, count > 0 else { return nil }
+            return total / Double(count)
+        }
+
+        guard textured.count >= minimumTexturedRows else {
+            // 余白ばかりで判断できないときは、想定どおり進んだものとする
+            return expectedShift.flatMap { (1...maxShift).contains($0) ? $0 : nil }
+        }
+
+        // 粗く全体を調べ、良さそうな候補だけを細かく調べ直す
+        let coarse = (1...maxShift).compactMap { shift in score(shift, stride: 6).map { (shift, $0) } }
+        let candidates = coarse.sorted { $0.1 < $1.1 }.prefix(8).map(\.0)
+        var refined: [(shift: Int, score: Double)] = []
+        for candidate in candidates {
+            for shift in max(1, candidate - 2)...min(maxShift, candidate + 2) {
+                if let value = score(shift, stride: 1) { refined.append((shift, value)) }
             }
         }
+        guard let best = refined.min(by: { $0.score < $1.score }), best.score < matchThreshold else { return nil }
 
-        // 票の多い順に、重なり全体がちゃんと一致するかを確かめる
-        for (shift, _) in votes.sorted(by: { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }).prefix(5) {
-            let overlap = (region.lowerBound..<(region.upperBound - shift))
-            guard overlap.count >= minimumOverlapRows else { continue }
-            let matched = overlap.filter { b.hashes[$0] == a.hashes[$0 + shift] }.count
-            if Double(matched) / Double(overlap.count) >= minimumMatchRatio {
-                return shift
-            }
+        // ほぼ同じくらい合う候補が複数あるときは、想定したスクロール量に近いものを選ぶ
+        if let expectedShift {
+            let close = refined.filter { $0.score <= best.score + 0.5 }
+            return close.min { abs($0.shift - expectedShift) < abs($1.shift - expectedShift) }?.shift ?? best.shift
         }
-        return nil
+        return best.shift
     }
 
     // MARK: - 画像の読み書き
 
-    /// ファイルの画像を 1 枚につなげて PNG で書き出す。direction はスクロールした向き。
+    /// ファイルの画像を 1 枚につなげて PNG で書き出す。
+    /// direction はスクロールした向き、expectedShiftPoints は 1 回に進むはずの量 (ポイント、分からなければ nil)。
     @concurrent
     static func stitch(
-        pages: [URL], direction: ScrollDirection, scale: CGFloat, to url: URL,
+        pages: [URL], direction: ScrollDirection, scale: CGFloat, expectedShiftPoints: Double? = nil, to url: URL,
         progress: @Sendable (Int) -> Void = { _ in }
     ) async throws -> Result {
         // 上・左へのスクロールは逆順に並べ、左右のスクロールは 90° 回して、どれも「下へのスクロール」として扱う
@@ -141,20 +246,17 @@ nonisolated enum Stitcher {
             return rotate(image, rotation)
         }
 
-        let ignored = Int(ignoredTrailingPoints * scale)
-        var frames: [FrameRows] = []
+        let ignored = Int(ignoredSidePoints * scale)
+        var frames: [FrameProfile] = []
         var width = 0
         for (index, page) in ordered.enumerated() {
             let image = try load(page)
             width = image.width
-            // 縦スクロールのスクロールバーは右端に、横スクロールのスクロールバーは下端 (回転後は左端) に出る
-            frames.append(direction.isVertical
-                ? rows(of: image, ignoringTrailingColumns: ignored)
-                : rows(of: image, ignoringLeadingColumns: ignored))
+            frames.append(profile(of: image, ignoringSideColumns: ignored))
             progress(index + 1)
         }
 
-        let plan = plan(frames)
+        let plan = plan(frames, expectedShift: expectedShiftPoints.map { Int(($0 * scale).rounded()) })
         guard plan.height > 0,
               let context = CGContext(
                   data: nil, width: width, height: plan.height, bitsPerComponent: 8, bytesPerRow: 0,
@@ -185,42 +287,22 @@ nonisolated enum Stitcher {
         return Result(pixelSize: CGSize(width: output.width, height: output.height), unmatchedCount: plan.unmatchedCount)
     }
 
-    /// 各行のピクセルのハッシュ。左端 ignoringLeadingColumns 列と右端 ignoringTrailingColumns 列は含めない
-    static func rows(of image: CGImage, ignoringLeadingColumns: Int = 0, ignoringTrailingColumns: Int = 0) -> FrameRows {
-        let width = image.width, height = image.height
-        let bytesPerRow = width * 4
-        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
-        pixels.withUnsafeMutableBytes { buffer in
+    /// 各行を横方向に profileWidth 個まで縮めた明るさの並び。左右の端 ignoringSideColumns 列は含めない
+    static func profile(of image: CGImage, ignoringSideColumns: Int = 0) -> FrameProfile {
+        let side = min(ignoringSideColumns, max(0, (image.width - 1) / 2))
+        let source = image.cropping(to: CGRect(x: side, y: 0, width: image.width - side * 2, height: image.height)) ?? image
+        let width = min(profileWidth, source.width), height = source.height
+        var values = [UInt8](repeating: 0, count: width * height)
+        values.withUnsafeMutableBytes { buffer in
+            // 横だけを縮めて描くと、各要素はその範囲のピクセルの平均になる (ビットマップの先頭行が画像の上端)
             let context = CGContext(
-                data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: bytesPerRow,
-                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue
             )
-            context?.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            context?.interpolationQuality = .medium
+            context?.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
         }
-
-        let leading = min(ignoringLeadingColumns, width - 1)
-        let trailing = min(ignoringTrailingColumns, width - 1 - leading)
-        let usedStart = leading * 4
-        let usedEnd = (width - trailing) * 4
-        var hashes = [UInt64](repeating: 0, count: height)
-        var isBlank = [Bool](repeating: true, count: height)
-        pixels.withUnsafeBytes { buffer in
-            let bytes = buffer.bindMemory(to: UInt8.self)
-            // ビットマップの先頭行が画像の上端
-            for y in 0..<height {
-                let start = y * bytesPerRow
-                var hash: UInt64 = 0xcbf2_9ce4_8422_2325  // FNV-1a
-                var blank = true
-                for i in usedStart..<usedEnd {
-                    let byte = bytes[start + i]
-                    hash = (hash ^ UInt64(byte)) &* 0x100_0000_01b3
-                    if blank && byte != bytes[start + usedStart + i % 4] { blank = false }
-                }
-                hashes[y] = hash
-                isBlank[y] = blank
-            }
-        }
-        return FrameRows(hashes: hashes, isBlank: isBlank)
+        return FrameProfile(width: width, values: values)
     }
 
     // MARK: - 回転
